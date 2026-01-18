@@ -5,9 +5,15 @@ import { pipeline, env, TextStreamer } from '@huggingface/transformers';
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
-// Memory optimization
-if (env.backends?.onnx?.wasm) {
-  (env.backends.onnx.wasm as any).numThreads = 1;
+// Check for WebGPU support
+async function checkWebGPU() {
+  if (!(navigator as any).gpu) {
+    throw new Error('WebGPU is not supported in this browser.');
+  }
+  const adapter = await (navigator as any).gpu.requestAdapter();
+  if (!adapter) {
+    throw new Error('No appropriate GPU adapter found.');
+  }
 }
 
 class InferencePipeline {
@@ -38,7 +44,7 @@ class InferencePipeline {
 
     this.llmPromise = pipeline('text-generation', 'Xenova/Phi-3-mini-4k-instruct', {
       device: 'webgpu',
-      dtype: 'q4',
+      dtype: 'q4', // 4-bit quantization for Phi-3
       progress_callback,
     }).then(instance => {
       this.llmInstance = instance;
@@ -49,16 +55,30 @@ class InferencePipeline {
   }
 }
 
-// Leaky queue to prevent GPU thrashing and maintain real-time feel
-const queue: { type: string; data: any }[] = [];
+// Priority Queue: Transcriptions take priority over Fact-checks
+const transcriptionQueue: { data: any }[] = [];
+const factCheckQueue: { data: any }[] = [];
 let isProcessing = false;
-const MAX_QUEUE_SIZE = 3;
+const MAX_FACT_CHECK_QUEUE_SIZE = 2;
 
 async function processQueue() {
-  if (isProcessing || queue.length === 0) return;
-  isProcessing = true;
+  if (isProcessing) return;
+  
+  let type: 'transcribe' | 'fact-check' | null = null;
+  let item: any = null;
 
-  const { type, data } = queue.shift()!;
+  if (transcriptionQueue.length > 0) {
+    type = 'transcribe';
+    item = transcriptionQueue.shift();
+  } else if (factCheckQueue.length > 0) {
+    type = 'fact-check';
+    item = factCheckQueue.shift();
+  }
+
+  if (!type || !item) return;
+  
+  isProcessing = true;
+  const { data } = item;
 
   try {
     if (type === 'transcribe') {
@@ -72,12 +92,13 @@ async function processQueue() {
     } else if (type === 'fact-check') {
       const llm = await InferencePipeline.getLLM();
       
-      // STEP A: CLASSIFICATION
+      // STEP A: CLASSIFICATION (Refined Prompt)
       const classificationPrompt = `<|system|>
-You are a classifier. Determine if the text contains a "verifiable factual claim".
+You are a precise linguistic analyzer. Identify if the following text contains a specific, verifiable factual claim that could be checked against history, science, or news.
+Ignore greetings, opinions, questions, or vague statements.
 Respond ONLY with "YES" or "NO".<|end|>
 <|user|>
-${data.text}<|end|>
+"${data.text}"<|end|>
 <|assistant|>`;
 
       const classificationResult = await llm(classificationPrompt, {
@@ -95,52 +116,52 @@ ${data.text}<|end|>
           id: data.id, 
           isDone: true 
         });
-        isProcessing = false;
-        processQueue();
-        return;
-      }
-
-      // STEP B: FACT-CHECK
-      const factCheckPrompt = `<|system|>
-You are a real-time fact-checker. Provide a verdict (True, False, or Unverified) and a brief 1-sentence explanation.
+      } else {
+        // STEP B: FACT-CHECK
+        const factCheckPrompt = `<|system|>
+You are a real-time fact-checker. Provide a verdict (True, False, or Unverified) and a 1-sentence explanation.
+Be objective and concise.
 Format: [VERDICT] | [EXPLANATION]<|end|>
 <|user|>
-${data.text}<|end|>
+"${data.text}"<|end|>
 <|assistant|>`;
 
-      let fullResponse = '';
-      const streamer = new TextStreamer(llm.tokenizer, {
-        skip_prompt: true,
-        callback_function: (text: string) => {
-          fullResponse += text;
-          self.postMessage({ 
-            status: 'fact-check-stream', 
-            text: fullResponse, 
-            id: data.id,
-            isDone: false 
-          });
-        },
-      });
+        let fullResponse = '';
+        const streamer = new TextStreamer(llm.tokenizer, {
+          skip_prompt: true,
+          callback_function: (text: string) => {
+            fullResponse += text;
+            self.postMessage({ 
+              status: 'fact-check-stream', 
+              text: fullResponse, 
+              id: data.id,
+              isDone: false 
+            });
+          },
+        });
 
-      await llm(factCheckPrompt, {
-        max_new_tokens: 128,
-        temperature: 0,
-        do_sample: false,
-        streamer,
-      });
+        await llm(factCheckPrompt, {
+          max_new_tokens: 100,
+          temperature: 0,
+          do_sample: false,
+          streamer,
+        });
 
-      self.postMessage({ 
-        status: 'fact-check-stream', 
-        text: fullResponse, 
-        id: data.id, 
-        isDone: true 
-      });
+        self.postMessage({ 
+          status: 'fact-check-stream', 
+          text: fullResponse, 
+          id: data.id, 
+          isDone: true 
+        });
+      }
     }
   } catch (error: any) {
+    console.error(`Error in worker (${type}):`, error);
     self.postMessage({ status: 'error', error: error.message, id: data.id, task: type });
   } finally {
     isProcessing = false;
-    processQueue();
+    // Process next item in the next tick
+    setTimeout(processQueue, 0);
   }
 }
 
@@ -155,24 +176,22 @@ self.onmessage = async (e: MessageEvent) => {
     };
 
     try {
+      await checkWebGPU();
       await InferencePipeline.getSTT(reportProgress('stt'));
       await InferencePipeline.getLLM(reportProgress('llm'));
       self.postMessage({ status: 'ready' });
     } catch (error: any) {
       self.postMessage({ status: 'error', error: error.message });
     }
-  } else {
-    // Leaky queue logic for fact-checks
-    if (type === 'fact-check') {
-      // If queue is too long, remove the oldest fact-check
-      const factCheckCount = queue.filter(q => q.type === 'fact-check').length;
-      if (factCheckCount >= MAX_QUEUE_SIZE) {
-        const index = queue.findIndex(q => q.type === 'fact-check');
-        if (index !== -1) queue.splice(index, 1);
-      }
+  } else if (type === 'transcribe') {
+    transcriptionQueue.push({ data });
+    processQueue();
+  } else if (type === 'fact-check') {
+    // Leaky queue for fact-checks only
+    if (factCheckQueue.length >= MAX_FACT_CHECK_QUEUE_SIZE) {
+      factCheckQueue.shift();
     }
-    
-    queue.push({ type, data });
+    factCheckQueue.push({ data });
     processQueue();
   }
 };

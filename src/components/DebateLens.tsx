@@ -42,10 +42,27 @@ export default function DebateLens() {
   const [isDualChannel, setIsDualChannel] = useState(false);
   const [activeSpeaker, setActiveSpeaker] = useState<'A' | 'B'>('A');
   const [status, setStatus] = useState<'initializing' | 'loading' | 'ready' | 'error'>('initializing');
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceA, setSelectedDeviceA] = useState<string>('');
+  const [selectedDeviceB, setSelectedDeviceB] = useState<string>('');
   const [progress, setProgress] = useState<{ stt: number; llm: number }>({ stt: 0, llm: 0 });
   const workerRef = useRef<Worker | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  // Fetch available microphones
+  useEffect(() => {
+    navigator.mediaDevices.enumerateDevices().then(devices => {
+      const audioDevices = devices.filter(d => d.kind === 'audioinput');
+      setDevices(audioDevices);
+      if (audioDevices.length > 0) {
+        setSelectedDeviceA(audioDevices[0].deviceId);
+        if (audioDevices.length > 1) {
+          setSelectedDeviceB(audioDevices[1].deviceId);
+        }
+      }
+    });
+  }, []);
 
   const onSpeechEndA = useCallback((audio: Float32Array) => {
     const id = Math.random().toString(36).substring(7);
@@ -67,8 +84,8 @@ export default function DebateLens() {
     }
   }, []);
 
-  const { vad: vadA } = useAudioProcessor(onSpeechEndA);
-  const { vad: vadB } = useAudioProcessor(onSpeechEndB); // For dual channel
+  const { vad: vadA } = useAudioProcessor(onSpeechEndA, selectedDeviceA);
+  const { vad: vadB } = useAudioProcessor(onSpeechEndB, selectedDeviceB); // For dual channel
 
   // Map the correct VAD to active speaker when not in dual channel
   const currentVad = isDualChannel 
@@ -76,8 +93,10 @@ export default function DebateLens() {
     : vadA;
 
   const clearFeed = useCallback(() => {
-    setTranscripts([]);
-    localStorage.removeItem('debatelens_transcripts');
+    if (confirm('Clear all transcripts?')) {
+      setTranscripts([]);
+      localStorage.removeItem('debatelens_transcripts');
+    }
   }, []);
 
   const copyToClipboard = useCallback(() => {
@@ -88,7 +107,6 @@ export default function DebateLens() {
       return `Speaker ${t.speaker}: ${t.text}${verdict}`;
     }).join('\n\n');
     navigator.clipboard.writeText(text);
-    alert('Transcript copied to clipboard!');
   }, [transcripts]);
 
   const activeSpeakerRef = useRef(activeSpeaker);
@@ -101,7 +119,7 @@ export default function DebateLens() {
 
   const handleTranscription = useCallback((text: string, id: string, speaker?: 'A' | 'B') => {
     const wordCount = text.trim().split(/\s+/).length;
-    if (wordCount < 5) return; 
+    if (wordCount < 3) return; // Reduced word count threshold for snappiness
 
     const finalSpeaker = isDualChannelRef.current ? (speaker || activeSpeakerRef.current) : activeSpeakerRef.current;
 
@@ -183,7 +201,6 @@ export default function DebateLens() {
     w.onmessage = (e) => {
       const { status, progress: p, model, text, id, error, isDone } = e.data;
 
-      if (status === 'loading') setStatus('loading');
       if (status === 'ready') setStatus('ready');
       if (status === 'error') {
         if (id) {
@@ -192,10 +209,12 @@ export default function DebateLens() {
           ));
         } else {
           setStatus('error');
+          setErrorMessage(error);
           console.error(error);
         }
       }
       if (status === 'progress') {
+        setStatus('loading');
         setProgress(prev => ({ ...prev, [model]: p }));
       }
       if (status === 'transcription') {
@@ -240,13 +259,26 @@ export default function DebateLens() {
         setActiveSpeaker(prev => prev === 'A' ? 'B' : 'A');
       }
       if (e.key === 'm') toggleListening();
-      if (e.key === 'c' && (e.ctrlKey || e.metaKey)) {
-        if (confirm('Clear all transcripts?')) clearFeed();
-      }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [clearFeed, toggleListening]);
+  }, [toggleListening]);
+
+  if (status === 'error') {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-slate-950 text-white p-8">
+        <AlertCircle className="w-12 h-12 text-red-500 mb-4" />
+        <h1 className="text-2xl font-bold mb-2">Initialization Failed</h1>
+        <p className="text-slate-400 text-center max-w-md">{errorMessage || 'An unknown error occurred while initializing WebGPU or loading models.'}</p>
+        <button 
+          onClick={() => window.location.reload()}
+          className="mt-8 px-6 py-2 bg-blue-600 rounded-lg font-bold hover:bg-blue-700 transition-colors"
+        >
+          Retry
+        </button>
+      </div>
+    );
+  }
 
   if (status === 'initializing' || status === 'loading') {
     return (
@@ -304,6 +336,25 @@ export default function DebateLens() {
         </div>
         
         <div className="flex items-center gap-6">
+          {isDualChannel && (
+            <div className="flex gap-2 animate-in fade-in slide-in-from-right-4">
+              <select 
+                value={selectedDeviceA}
+                onChange={(e) => setSelectedDeviceA(e.target.value)}
+                className="bg-slate-800/50 border border-slate-700/50 text-[10px] rounded px-2 py-1 text-blue-400 font-bold"
+              >
+                {devices.map(d => <option key={d.deviceId} value={d.deviceId}>A: {d.label.slice(0, 15)}...</option>)}
+              </select>
+              <select 
+                value={selectedDeviceB}
+                onChange={(e) => setSelectedDeviceB(e.target.value)}
+                className="bg-slate-800/50 border border-slate-700/50 text-[10px] rounded px-2 py-1 text-red-400 font-bold"
+              >
+                {devices.map(d => <option key={d.deviceId} value={d.deviceId}>B: {d.label.slice(0, 15)}...</option>)}
+              </select>
+            </div>
+          )}
+          
           <button 
             onClick={() => setIsDualChannel(!isDualChannel)}
             className={cn(
