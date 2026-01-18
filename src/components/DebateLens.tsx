@@ -65,7 +65,8 @@ export default function DebateLens() {
   }, [activeSpeaker]);
 
   const handleTranscription = useCallback((text: string, id: string) => {
-    if (text.trim().length < 3) return; 
+    const wordCount = text.trim().split(/\s+/).length;
+    if (wordCount < 5) return; 
 
     setTranscripts(prev => [
       ...prev,
@@ -84,38 +85,39 @@ export default function DebateLens() {
     });
   }, []);
 
-  const handleFactCheckResult = useCallback((result: string, id: string) => {
+  const handleFactCheckStream = useCallback((result: string, id: string, isDone: boolean) => {
     setTranscripts(prev => prev.map(t => {
       if (t.id === id) {
         const trimmedResult = result.trim();
-        if (trimmedResult.toUpperCase().includes('NOT_A_CLAIM') && trimmedResult.length < 15) {
-          return { ...t, isChecking: false, factCheck: { verdict: 'NOT_A_CLAIM', explanation: '' } };
+        
+        if (trimmedResult.toUpperCase().includes('NOT_A_CLAIM') && trimmedResult.length < 20) {
+          return { 
+            ...t, 
+            isChecking: !isDone, 
+            factCheck: isDone ? { verdict: 'NOT_A_CLAIM', explanation: '' } : undefined 
+          };
         }
         
-        // Robust parsing: Handles [Verdict] Explanation, Verdict: Explanation, or [Verdict] | Explanation
+        // Robust parsing during streaming
         const verdictMatch = result.match(/\[?(True|False|Unverified)\]?[:\s|]*-?\s*(.*)/i);
         
         if (verdictMatch) {
           const verdictStr = verdictMatch[1].toLowerCase();
           const verdict = (verdictStr.charAt(0).toUpperCase() + verdictStr.slice(1)) as 'True' | 'False' | 'Unverified';
-          const explanation = verdictMatch[2].trim() || result;
+          const explanation = verdictMatch[2].trim() || 'Analyzing...';
           
           return {
             ...t,
-            isChecking: false,
+            isChecking: !isDone,
             factCheck: { verdict, explanation }
           };
         }
 
-        // Final fallback: just look for keywords anywhere
-        let verdict: 'True' | 'False' | 'Unverified' = 'Unverified';
-        if (result.toLowerCase().includes('true')) verdict = 'True';
-        else if (result.toLowerCase().includes('false')) verdict = 'False';
-
+        // Fallback for partial/initial stream
         return {
           ...t,
-          isChecking: false,
-          factCheck: { verdict, explanation: result.replace(/\[?True|False|Unverified\]?[:\s|]*/i, '').trim() || result }
+          isChecking: !isDone,
+          factCheck: { verdict: 'Unverified', explanation: result }
         };
       }
       return t;
@@ -127,7 +129,9 @@ export default function DebateLens() {
     const saved = localStorage.getItem('debatelens_transcripts');
     if (saved) {
       try {
-        setTranscripts(JSON.parse(saved));
+        const parsed = JSON.parse(saved);
+        // Ensure we don't restore 'checking' state
+        setTranscripts(parsed.map((t: any) => ({ ...t, isChecking: false })));
       } catch (e) {
         console.error('Failed to parse saved transcripts', e);
       }
@@ -154,15 +158,14 @@ export default function DebateLens() {
     });
     
     w.onmessage = (e) => {
-      const { status, progress: p, model, text, result, id, error, task } = e.data;
+      const { status, progress: p, model, text, result, id, error, task, isDone } = e.data;
 
       if (status === 'loading') setStatus('loading');
       if (status === 'ready') setStatus('ready');
       if (status === 'error') {
         if (id) {
-          // Per-transcript error
           setTranscripts(prev => prev.map(t => 
-            t.id === id ? { ...t, isChecking: false, factCheck: { verdict: 'Unverified', explanation: `Error during ${task}: ${error}` } } : t
+            t.id === id ? { ...t, isChecking: false, factCheck: { verdict: 'Unverified', explanation: `Error: ${error}` } } : t
           ));
         } else {
           setStatus('error');
@@ -170,13 +173,13 @@ export default function DebateLens() {
         }
       }
       if (status === 'progress') {
-        setProgress(prev => ({ ...prev, [model]: p.progress }));
+        setProgress(prev => ({ ...prev, [model]: p }));
       }
       if (status === 'transcription') {
         handleTranscription(text, id);
       }
-      if (status === 'fact-check-result') {
-        handleFactCheckResult(result, id);
+      if (status === 'fact-check-stream') {
+        handleFactCheckStream(text, id, isDone);
       }
     };
 
@@ -184,7 +187,7 @@ export default function DebateLens() {
     workerRef.current = w;
 
     return () => w.terminate();
-  }, [handleTranscription, handleFactCheckResult]);
+  }, [handleTranscription, handleFactCheckStream]);
 
   const toggleListening = useCallback(() => {
     if (vad.listening) {
