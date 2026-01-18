@@ -24,24 +24,56 @@ interface Transcript {
 }
 
 export default function DebateLens() {
-  const [transcripts, setTranscripts] = useState<Transcript[]>([]);
+  const [transcripts, setTranscripts] = useState<Transcript[]>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('debatelens_transcripts');
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return parsed.map((t: any) => ({ ...t, isChecking: false }));
+        } catch (e) {
+          console.error('Failed to parse saved transcripts', e);
+        }
+      }
+    }
+    return [];
+  });
+  const [isDualChannel, setIsDualChannel] = useState(false);
   const [activeSpeaker, setActiveSpeaker] = useState<'A' | 'B'>('A');
   const [status, setStatus] = useState<'initializing' | 'loading' | 'ready' | 'error'>('initializing');
   const [progress, setProgress] = useState<{ stt: number; llm: number }>({ stt: 0, llm: 0 });
   const workerRef = useRef<Worker | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
 
-  const onSpeechEnd = useCallback((audio: Float32Array) => {
+
+  const onSpeechEndA = useCallback((audio: Float32Array) => {
     const id = Math.random().toString(36).substring(7);
     if (workerRef.current) {
       workerRef.current.postMessage({
         type: 'transcribe',
-        data: { audio, id }
-      }, [audio.buffer]); // Transferable: avoid copying large audio buffer
+        data: { audio, id, speaker: 'A' }
+      }, [audio.buffer]);
     }
   }, []);
 
-  const { vad } = useAudioProcessor(onSpeechEnd);
+  const onSpeechEndB = useCallback((audio: Float32Array) => {
+    const id = Math.random().toString(36).substring(7);
+    if (workerRef.current) {
+      workerRef.current.postMessage({
+        type: 'transcribe',
+        data: { audio, id, speaker: 'B' }
+      }, [audio.buffer]);
+    }
+  }, []);
+
+  const { vad: vadA } = useAudioProcessor(onSpeechEndA);
+  const { vad: vadB } = useAudioProcessor(onSpeechEndB); // For dual channel
+
+  // Map the correct VAD to active speaker when not in dual channel
+  const currentVad = isDualChannel 
+    ? (activeSpeaker === 'A' ? vadA : vadB) 
+    : vadA;
 
   const clearFeed = useCallback(() => {
     setTranscripts([]);
@@ -60,20 +92,25 @@ export default function DebateLens() {
   }, [transcripts]);
 
   const activeSpeakerRef = useRef(activeSpeaker);
+  const isDualChannelRef = useRef(isDualChannel);
+  
   useEffect(() => {
     activeSpeakerRef.current = activeSpeaker;
-  }, [activeSpeaker]);
+    isDualChannelRef.current = isDualChannel;
+  }, [activeSpeaker, isDualChannel]);
 
-  const handleTranscription = useCallback((text: string, id: string) => {
+  const handleTranscription = useCallback((text: string, id: string, speaker?: 'A' | 'B') => {
     const wordCount = text.trim().split(/\s+/).length;
     if (wordCount < 5) return; 
+
+    const finalSpeaker = isDualChannelRef.current ? (speaker || activeSpeakerRef.current) : activeSpeakerRef.current;
 
     setTranscripts(prev => [
       ...prev,
       {
         id,
         text,
-        speaker: activeSpeakerRef.current,
+        speaker: finalSpeaker,
         isChecking: true,
         timestamp: Date.now(),
       }
@@ -124,20 +161,6 @@ export default function DebateLens() {
     }));
   }, []);
 
-  // Load from localStorage
-  useEffect(() => {
-    const saved = localStorage.getItem('debatelens_transcripts');
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        // Ensure we don't restore 'checking' state
-        setTranscripts(parsed.map((t: any) => ({ ...t, isChecking: false })));
-      } catch (e) {
-        console.error('Failed to parse saved transcripts', e);
-      }
-    }
-  }, []);
-
   // Save to localStorage
   useEffect(() => {
     if (transcripts.length > 0) {
@@ -158,7 +181,7 @@ export default function DebateLens() {
     });
     
     w.onmessage = (e) => {
-      const { status, progress: p, model, text, result, id, error, task, isDone } = e.data;
+      const { status, progress: p, model, text, id, error, isDone } = e.data;
 
       if (status === 'loading') setStatus('loading');
       if (status === 'ready') setStatus('ready');
@@ -176,7 +199,8 @@ export default function DebateLens() {
         setProgress(prev => ({ ...prev, [model]: p }));
       }
       if (status === 'transcription') {
-        handleTranscription(text, id);
+        const { speaker } = e.data;
+        handleTranscription(text, id, speaker);
       }
       if (status === 'fact-check-stream') {
         handleFactCheckStream(text, id, isDone);
@@ -190,12 +214,22 @@ export default function DebateLens() {
   }, [handleTranscription, handleFactCheckStream]);
 
   const toggleListening = useCallback(() => {
-    if (vad.listening) {
-      vad.pause();
+    if (isDualChannel) {
+      if (vadA.listening || vadB.listening) {
+        vadA.pause();
+        vadB.pause();
+      } else {
+        vadA.start();
+        vadB.start();
+      }
     } else {
-      vad.start();
+      if (vadA.listening) {
+        vadA.pause();
+      } else {
+        vadA.start();
+      }
     }
-  }, [vad]);
+  }, [isDualChannel, vadA, vadB]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -263,13 +297,25 @@ export default function DebateLens() {
       <header className="flex items-center justify-between px-6 py-4 border-b border-slate-800/50 bg-slate-900/40 backdrop-blur-xl sticky top-0 z-10">
         <div className="flex items-center gap-3">
           <div className="relative">
-            <div className={cn("w-3 h-3 rounded-full transition-colors duration-500", vad.userSpeaking ? "bg-green-500" : "bg-red-500")} />
-            {vad.userSpeaking && <div className="absolute inset-0 w-3 h-3 rounded-full bg-green-500 animate-ping opacity-75" />}
+            <div className={cn("w-3 h-3 rounded-full transition-colors duration-500", (vadA.userSpeaking || vadB.userSpeaking) ? "bg-green-500" : "bg-red-500")} />
+            {(vadA.userSpeaking || vadB.userSpeaking) && <div className="absolute inset-0 w-3 h-3 rounded-full bg-green-500 animate-ping opacity-75" />}
           </div>
           <h1 className="font-black text-2xl tracking-tighter italic uppercase">Debate<span className="text-blue-500 not-italic">Lens</span></h1>
         </div>
         
         <div className="flex items-center gap-6">
+          <button 
+            onClick={() => setIsDualChannel(!isDualChannel)}
+            className={cn(
+              "px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest border transition-all",
+              isDualChannel 
+                ? "bg-blue-500/20 border-blue-500/50 text-blue-400" 
+                : "bg-slate-800/50 border-slate-700/50 text-slate-500"
+            )}
+          >
+            Dual Channel {isDualChannel ? "ON" : "OFF"}
+          </button>
+
           <div className="flex bg-slate-800/50 rounded-xl p-1 border border-slate-700/50 shadow-inner">
             <button 
               onClick={() => setActiveSpeaker('A')}
@@ -320,15 +366,15 @@ export default function DebateLens() {
             onClick={toggleListening}
             className={cn(
               "hidden md:flex items-center gap-2 px-4 py-2 rounded-xl border font-bold text-xs uppercase tracking-widest transition-all duration-300 active:scale-95",
-              !vad.listening
+              !currentVad.listening
                 ? "border-red-500/50 bg-red-500/10 text-red-400"
-                : vad.userSpeaking 
+                : (vadA.userSpeaking || vadB.userSpeaking) 
                   ? "border-green-500/50 bg-green-500/10 text-green-400 shadow-[0_0_15px_rgba(34,197,94,0.3)]" 
                   : "border-slate-700 bg-slate-800/50 text-slate-500"
             )}
           >
-            {!vad.listening ? <MicOff className="w-3.5 h-3.5" /> : (vad.userSpeaking ? <Mic className="w-3.5 h-3.5 animate-bounce" /> : <Mic className="w-3.5 h-3.5" />)}
-            {!vad.listening ? "Muted" : (vad.userSpeaking ? "Live Audio" : "Listening")}
+            {!currentVad.listening ? <MicOff className="w-3.5 h-3.5" /> : ((vadA.userSpeaking || vadB.userSpeaking) ? <Mic className="w-3.5 h-3.5 animate-bounce" /> : <Mic className="w-3.5 h-3.5" />)}
+            {!currentVad.listening ? "Muted" : ((vadA.userSpeaking || vadB.userSpeaking) ? "Live Audio" : "Listening")}
           </button>
         </div>
       </header>
@@ -352,12 +398,22 @@ export default function DebateLens() {
               )}
             >
               <div className={cn(
-                "px-6 py-5 rounded-3xl text-lg md:text-xl shadow-2xl transition-all duration-500 leading-relaxed",
+                "px-6 py-5 rounded-3xl text-lg md:text-xl shadow-2xl transition-all duration-700 leading-relaxed relative overflow-hidden",
                 t.speaker === 'A' 
                   ? "bg-slate-900/80 rounded-tl-none border-l-4 border-blue-500/50" 
                   : "bg-slate-900/80 rounded-tr-none border-r-4 border-red-500/50 text-right",
-                t.isChecking && (t.speaker === 'A' ? "shadow-[0_0_40px_rgba(59,130,246,0.1)]" : "shadow-[0_0_40px_rgba(239,68,68,0.1)]")
+                t.isChecking && (t.speaker === 'A' ? "shadow-[0_0_50px_rgba(59,130,246,0.3)] border-blue-400" : "shadow-[0_0_50px_rgba(239,68,68,0.3)] border-red-400")
               )}>
+                {t.isChecking && (
+                  <motion.div 
+                    className={cn(
+                      "absolute inset-0 opacity-20 pointer-events-none",
+                      t.speaker === 'A' ? "bg-gradient-to-r from-blue-600/0 via-blue-600/50 to-blue-600/0" : "bg-gradient-to-r from-red-600/0 via-red-600/50 to-red-600/0"
+                    )}
+                    animate={{ x: ['-100%', '100%'] }}
+                    transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
+                  />
+                )}
                 <div className={cn(
                   "flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.2em] mb-3",
                   t.speaker === 'A' ? "text-blue-500" : "text-red-500 justify-end"
@@ -366,7 +422,7 @@ export default function DebateLens() {
                   Speaker {t.speaker}
                   {t.speaker === 'B' && <div className="w-2 h-2 rounded-full bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.8)]" />}
                 </div>
-                <span className="text-slate-100 font-medium">
+                <span className="text-slate-100 font-medium relative z-10">
                   {t.text}
                 </span>
               </div>

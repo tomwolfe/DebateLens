@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { pipeline, env, TextStreamer } from '@huggingface/transformers';
 
 // Skip local model check
@@ -6,7 +7,7 @@ env.useBrowserCache = true;
 
 // Memory optimization
 if (env.backends?.onnx?.wasm) {
-  env.backends.onnx.wasm.numThreads = 1;
+  (env.backends.onnx.wasm as any).numThreads = 1;
 }
 
 class InferencePipeline {
@@ -48,9 +49,10 @@ class InferencePipeline {
   }
 }
 
-// Simple queue to prevent GPU thrashing
+// Leaky queue to prevent GPU thrashing and maintain real-time feel
 const queue: { type: string; data: any }[] = [];
 let isProcessing = false;
+const MAX_QUEUE_SIZE = 3;
 
 async function processQueue() {
   if (isProcessing || queue.length === 0) return;
@@ -66,16 +68,42 @@ async function processQueue() {
         stride_length_s: 5,
         return_timestamps: true,
       });
-      self.postMessage({ status: 'transcription', text: output.text, id: data.id });
+      self.postMessage({ status: 'transcription', text: output.text, id: data.id, speaker: data.speaker });
     } else if (type === 'fact-check') {
       const llm = await InferencePipeline.getLLM();
       
-      const prompt = `<|system|>
-You are a real-time fact-checker. Determine if the following statement contains a verifiable factual claim.
-If it is NOT a factual claim (e.g., a greeting, an opinion, a question, or a vague statement), respond ONLY with "NOT_A_CLAIM".
-If it IS a factual claim, provide a verdict (True, False, or Unverified) and a brief 1-sentence explanation.
-Format: [VERDICT] | [EXPLANATION]
-Maintain objectivity and focus on consensus facts.<|end|>
+      // STEP A: CLASSIFICATION
+      const classificationPrompt = `<|system|>
+You are a classifier. Determine if the text contains a "verifiable factual claim".
+Respond ONLY with "YES" or "NO".<|end|>
+<|user|>
+${data.text}<|end|>
+<|assistant|>`;
+
+      const classificationResult = await llm(classificationPrompt, {
+        max_new_tokens: 5,
+        temperature: 0,
+        do_sample: false,
+      });
+
+      const isClaim = classificationResult[0].generated_text.toUpperCase().includes('YES');
+
+      if (!isClaim) {
+        self.postMessage({ 
+          status: 'fact-check-stream', 
+          text: 'NOT_A_CLAIM', 
+          id: data.id, 
+          isDone: true 
+        });
+        isProcessing = false;
+        processQueue();
+        return;
+      }
+
+      // STEP B: FACT-CHECK
+      const factCheckPrompt = `<|system|>
+You are a real-time fact-checker. Provide a verdict (True, False, or Unverified) and a brief 1-sentence explanation.
+Format: [VERDICT] | [EXPLANATION]<|end|>
 <|user|>
 ${data.text}<|end|>
 <|assistant|>`;
@@ -94,7 +122,7 @@ ${data.text}<|end|>
         },
       });
 
-      await llm(prompt, {
+      await llm(factCheckPrompt, {
         max_new_tokens: 128,
         temperature: 0,
         do_sample: false,
@@ -134,7 +162,16 @@ self.onmessage = async (e: MessageEvent) => {
       self.postMessage({ status: 'error', error: error.message });
     }
   } else {
-    // Add to queue for transcription and fact-checking
+    // Leaky queue logic for fact-checks
+    if (type === 'fact-check') {
+      // If queue is too long, remove the oldest fact-check
+      const factCheckCount = queue.filter(q => q.type === 'fact-check').length;
+      if (factCheckCount >= MAX_QUEUE_SIZE) {
+        const index = queue.findIndex(q => q.type === 'fact-check');
+        if (index !== -1) queue.splice(index, 1);
+      }
+    }
+    
     queue.push({ type, data });
     processQueue();
   }
