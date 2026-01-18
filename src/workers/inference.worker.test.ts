@@ -92,7 +92,13 @@ describe('inference.worker', () => {
   });
 
   it('should handle fact-check message', async () => {
-    const mockLLM = vi.fn().mockResolvedValue([{ generated_text: 'YES' }]); // Classification
+    const mockLLM = vi.fn().mockImplementation(async (prompt, options) => {
+      if (options.streamer) {
+        options.streamer.options.callback_function('[VERDICT] True: This is a test.');
+      }
+      return [{ generated_text: '[VERDICT] True: This is a test.' }];
+    });
+    
     (pipeline as any).mockImplementation((type: string) => {
         if (type === 'text-generation') return Promise.resolve(mockLLM);
         return Promise.resolve(vi.fn());
@@ -106,16 +112,22 @@ describe('inference.worker', () => {
 
     await waitForPostMessage('fact-check-stream');
 
-    // Classification should be YES, then it should call LLM again for fact checking
     expect(mockLLM).toHaveBeenCalled();
     expect(mockPostMessage).toHaveBeenCalledWith(expect.objectContaining({
       status: 'fact-check-stream',
-      id: '123'
+      id: '123',
+      text: expect.stringContaining('VERDICT')
     }));
   });
 
   it('should handle non-claim fact-check message', async () => {
-    const mockLLM = vi.fn().mockResolvedValue([{ generated_text: 'NO' }]); // Classification
+    const mockLLM = vi.fn().mockImplementation(async (prompt, options) => {
+      if (options.streamer) {
+        options.streamer.options.callback_function('[NOT_A_CLAIM]');
+      }
+      return [{ generated_text: '[NOT_A_CLAIM]' }];
+    });
+
     (pipeline as any).mockImplementation((type: string) => {
         if (type === 'text-generation') return Promise.resolve(mockLLM);
         return Promise.resolve(vi.fn());

@@ -91,12 +91,25 @@ export default function DebateLens() {
   const activeSpeakerRef = useRef(activeSpeaker);
 
   useEffect(() => {
+    // eslint-disable-next-line react-hooks/immutability
     activeSpeakerRef.current = activeSpeaker;
   }, [activeSpeaker]);
 
+  const deleteTranscript = useCallback((id: string) => {
+    setTranscripts(prev => prev.filter(t => t.id !== id));
+  }, []);
+
   const handleTranscription = useCallback((text: string, id: string) => {
-    const wordCount = text.trim().split(/\s+/).length;
-    if (wordCount < 3) return; // Reduced word count threshold for snappiness
+    const trimmedText = text.trim();
+    const wordCount = trimmedText.split(/\s+/).length;
+    
+    // Intelligent filtering:
+    // 1. Minimum 4 words for speech (increased from 3)
+    // 2. Filter out common filler phrases and short fragments
+    const fillers = /^(um|uh|ah|er|basically|actually|literally|honestly|you know|i mean|so|well|like)\s*,?\s*/i;
+    const cleanText = trimmedText.replace(fillers, '');
+    
+    if (wordCount < 4 || cleanText.length < 10) return;
 
     const finalSpeaker = activeSpeakerRef.current;
 
@@ -104,7 +117,7 @@ export default function DebateLens() {
       ...prev,
       {
         id,
-        text,
+        text: trimmedText,
         speaker: finalSpeaker,
         isChecking: true,
         timestamp: Date.now(),
@@ -113,7 +126,7 @@ export default function DebateLens() {
 
     workerRef.current?.postMessage({
       type: 'fact-check',
-      data: { text, id }
+      data: { text: trimmedText, id }
     });
   }, []);
 
@@ -122,11 +135,11 @@ export default function DebateLens() {
       if (t.id === id) {
         const trimmedResult = result.trim();
 
-        if (trimmedResult.toUpperCase().includes('NOT_A_CLAIM') && trimmedResult.length < 20) {
+        if (trimmedResult.includes('NOT_A_CLAIM')) {
           return {
             ...t,
-            isChecking: !isDone,
-            factCheck: isDone ? { verdict: 'NOT_A_CLAIM', explanation: '' } : undefined
+            isChecking: false,
+            factCheck: { verdict: 'NOT_A_CLAIM', explanation: '' }
           };
         }
 
@@ -134,8 +147,13 @@ export default function DebateLens() {
         let verdict: 'True' | 'False' | 'Unverified' | null = null;
         let explanation = '';
 
-        // Format 1: [Verdict] Explanation
-        let verdictMatch = result.match(/\[([Tt]rue|[Ff]alse|[Uu]nverified)\]\s*(.*)/);
+        // Format 0: [VERDICT] Verdict Explanation (New merged format)
+        let verdictMatch = result.match(/\[VERDICT\]\s*([Tt]rue|[Ff]alse|[Uu]nverified)\s*(.*)/i);
+        
+        if (!verdictMatch) {
+          // Format 1: [Verdict] Explanation
+          verdictMatch = result.match(/\[([Tt]rue|[Ff]alse|[Uu]nverified)\]\s*(.*)/);
+        }
         if (!verdictMatch) {
           // Format 2: Verdict: Explanation
           verdictMatch = result.match(/([Tt]rue|[Ff]alse|[Uu]nverified):\s*(.*)/);
@@ -148,20 +166,19 @@ export default function DebateLens() {
           // Format 4: Verdict - Explanation
           verdictMatch = result.match(/([Tt]rue|[Ff]alse|[Uu]nverified)\s*[-–—]\s*(.*)/);
         }
-        if (!verdictMatch) {
-          // Format 5: Just verdict word with context
-          const verdictWordMatch = result.match(/\b([Tt]rue|[Ff]alse|[Uu]nverified)\b/);
-          if (verdictWordMatch) {
-            const matchedVerdict = verdictWordMatch[1].toLowerCase();
-            verdict = (matchedVerdict.charAt(0).toUpperCase() + matchedVerdict.slice(1)) as 'True' | 'False' | 'Unverified';
-            explanation = result.replace(verdictWordMatch[0], '').trim() || 'Analyzing...';
-          }
-        }
 
         if (verdictMatch) {
           const matchedVerdict = verdictMatch[1].toLowerCase();
           verdict = (matchedVerdict.charAt(0).toUpperCase() + matchedVerdict.slice(1)) as 'True' | 'False' | 'Unverified';
           explanation = verdictMatch[2].trim() || 'Analyzing...';
+        } else {
+          // Format 5: Just verdict word with context
+          const verdictWordMatch = result.match(/\b([Tt]rue|[Ff]alse|[Uu]nverified)\b/i);
+          if (verdictWordMatch) {
+            const matchedVerdict = verdictWordMatch[1].toLowerCase();
+            verdict = (matchedVerdict.charAt(0).toUpperCase() + matchedVerdict.slice(1)) as 'True' | 'False' | 'Unverified';
+            explanation = result.replace(verdictWordMatch[0], '').replace('[VERDICT]', '').trim() || 'Analyzing...';
+          }
         }
 
         // If we have a verdict, use it; otherwise default to Unverified
@@ -174,10 +191,11 @@ export default function DebateLens() {
         }
 
         // Fallback for partial/initial stream
+        const cleanDisplayResult = result.replace('[VERDICT]', '').trim();
         return {
           ...t,
           isChecking: !isDone,
-          factCheck: { verdict: 'Unverified', explanation: result }
+          factCheck: { verdict: 'Unverified', explanation: cleanDisplayResult || 'Analyzing...' }
         };
       }
       return t;
@@ -218,9 +236,7 @@ export default function DebateLens() {
 
   // Save to localStorage
   useEffect(() => {
-    if (transcripts.length > 0) {
-      localStorage.setItem('debatelens_transcripts', JSON.stringify(transcripts));
-    }
+    localStorage.setItem('debatelens_transcripts', JSON.stringify(transcripts));
   }, [transcripts]);
 
   // Auto-scroll
@@ -292,7 +308,7 @@ export default function DebateLens() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [toggleListening]);
+  }, [toggleListening, clearFeed]);
 
   if (status === 'error') {
     return (
@@ -369,7 +385,7 @@ export default function DebateLens() {
               <AlertCircle className="w-5 h-5" />
             </div>
             <div className="text-sm text-slate-300">
-              <p className="font-medium mb-1">What's happening now?</p>
+              <p className="font-medium mb-1">What&apos;s happening now?</p>
               <ul className="space-y-1 text-slate-400">
                 <li className="flex items-start gap-2">
                   <span className="text-blue-400 mt-1">•</span>
@@ -548,7 +564,7 @@ export default function DebateLens() {
               )}
             >
               <div className={cn(
-                "px-6 py-5 rounded-3xl text-lg md:text-xl shadow-2xl transition-all duration-700 leading-relaxed relative overflow-hidden",
+                "px-6 py-5 rounded-3xl text-lg md:text-xl shadow-2xl transition-all duration-700 leading-relaxed relative group overflow-hidden",
                 t.speaker === 'A' 
                   ? "bg-slate-900/80 rounded-tl-none border-l-4 border-blue-500/50" 
                   : "bg-slate-900/80 rounded-tr-none border-r-4 border-red-500/50 text-right",
@@ -564,6 +580,18 @@ export default function DebateLens() {
                     transition={{ repeat: Infinity, duration: 2, ease: "linear" }}
                   />
                 )}
+                
+                <button
+                  onClick={() => deleteTranscript(t.id)}
+                  className={cn(
+                    "absolute top-4 opacity-0 group-hover:opacity-100 transition-opacity p-1.5 hover:bg-red-500/20 rounded-lg text-slate-500 hover:text-red-400 z-20",
+                    t.speaker === 'A' ? "right-4" : "left-4"
+                  )}
+                  title="Delete transcript"
+                >
+                  <Trash2 className="w-4 h-4" />
+                </button>
+
                 <div className={cn(
                   "flex items-center gap-2 text-[10px] font-black uppercase tracking-[0.2em] mb-3",
                   t.speaker === 'A' ? "text-blue-500" : "text-red-500 justify-end"

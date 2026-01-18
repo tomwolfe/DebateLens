@@ -92,66 +92,54 @@ async function processQueue() {
     } else if (type === 'fact-check') {
       const llm = await InferencePipeline.getLLM();
       
-      // STEP A: CLASSIFICATION (Refined Prompt)
-      const classificationPrompt = `<|system|>
-You are a precise linguistic analyzer. Identify if the following text contains a specific, verifiable factual claim that could be checked against history, science, or news.
-Ignore greetings, opinions, questions, or vague statements.
-Respond ONLY with "YES" or "NO".
-A factual claim is a statement that can be proven true or false with evidence.<|end|>
+      const prompt = `<|system|>
+You are a real-time fact-checker. Analyze the following text and determine if it contains a verifiable factual claim.
+- If it is NOT a factual claim (e.g., greeting, opinion, fragment, filler), start your response with [NOT_A_CLAIM].
+- If it IS a factual claim, start your response with [VERDICT] followed by True, False, or Unverified, then a 1-sentence explanation.
+
+Example 1: "Hello how are you?" -> [NOT_A_CLAIM]
+Example 2: "The moon is made of cheese." -> [VERDICT] False. The moon is composed of rock and metal.
+Example 3: "I think we should go." -> [NOT_A_CLAIM]
+
+Format: [VERDICT] {Verdict} {Explanation} or [NOT_A_CLAIM]<|end|>
 <|user|>
 "${data.text}"<|end|>
 <|assistant|>`;
 
-      const classificationResult = await llm(classificationPrompt, {
-        max_new_tokens: 5,
-        temperature: 0,
-        do_sample: false,
-      });
-
-      const isClaim = classificationResult[0].generated_text.toUpperCase().includes('YES');
-
-      if (!isClaim) {
-        self.postMessage({ 
-          status: 'fact-check-stream', 
-          text: 'NOT_A_CLAIM', 
-          id: data.id, 
-          isDone: true 
-        });
-      } else {
-        // STEP B: FACT-CHECK
-        const factCheckPrompt = `<|system|>
-You are a real-time fact-checker. Provide a verdict (True, False, or Unverified) and a 1-sentence explanation.
-Be objective and concise.
-Format your response as: [VERDICT] EXPLANATION
-Where VERDICT is exactly one of: True, False, Unverified
-Example: [True] Water boils at 100°C at sea level.
-Example: [False] The Earth is flat.
-Example: [Unverified] This claim requires further investigation.<|end|>
-<|user|>
-"${data.text}"<|end|>
-<|assistant|>`;
-
-        let fullResponse = '';
-        const streamer = new TextStreamer(llm.tokenizer, {
-          skip_prompt: true,
-          callback_function: (text: string) => {
-            fullResponse += text;
+      let fullResponse = '';
+      const streamer = new TextStreamer(llm.tokenizer, {
+        skip_prompt: true,
+        callback_function: (text: string) => {
+          fullResponse += text;
+          
+          // Early exit if we detect NOT_A_CLAIM
+          if (fullResponse.includes('[NOT_A_CLAIM]')) {
             self.postMessage({ 
               status: 'fact-check-stream', 
-              text: fullResponse, 
+              text: 'NOT_A_CLAIM', 
               id: data.id,
-              isDone: false 
+              isDone: true 
             });
-          },
-        });
+            return;
+          }
 
-        await llm(factCheckPrompt, {
-          max_new_tokens: 100,
-          temperature: 0,
-          do_sample: false,
-          streamer,
-        });
+          self.postMessage({ 
+            status: 'fact-check-stream', 
+            text: fullResponse, 
+            id: data.id,
+            isDone: false 
+          });
+        },
+      });
 
+      await llm(prompt, {
+        max_new_tokens: 100,
+        temperature: 0,
+        do_sample: false,
+        streamer,
+      });
+
+      if (!fullResponse.includes('[NOT_A_CLAIM]')) {
         self.postMessage({ 
           status: 'fact-check-stream', 
           text: fullResponse, 
