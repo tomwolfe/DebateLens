@@ -54,8 +54,13 @@ describe('DebateLens', () => {
     })();
     vi.stubGlobal('localStorage', localStorageMock);
 
-    // Mock clipboard
+    // Mock navigator.mediaDevices and clipboard
     vi.stubGlobal('navigator', {
+      mediaDevices: {
+        enumerateDevices: vi.fn().mockResolvedValue([
+          { deviceId: 'dev1', label: 'Mic 1', kind: 'audioinput' },
+        ]),
+      },
       clipboard: {
         writeText: vi.fn().mockResolvedValue(undefined),
       },
@@ -104,7 +109,7 @@ describe('DebateLens', () => {
       mockWorkerInstance.onmessage({ data: { status: 'ready' } });
     });
 
-    // Simulate transcription
+    // Simulate transcription (must be > 2 words)
     await act(async () => {
       mockWorkerInstance.onmessage({ 
         data: { 
@@ -119,7 +124,7 @@ describe('DebateLens', () => {
     expect(screen.getByText(/Analyzing Claim.../i)).toBeInTheDocument();
   });
 
-  it('handles fact-check result from worker', async () => {
+  it('handles fact-check stream from worker', async () => {
     render(<DebateLens />);
     await act(async () => {
       mockWorkerInstance.onmessage({ data: { status: 'ready' } });
@@ -128,17 +133,18 @@ describe('DebateLens', () => {
     // Transcription first
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Water is wet.', id: '123' } 
+        data: { status: 'transcription', text: 'Water is wet and cold.', id: '123' } 
       });
     });
 
-    // Fact check result
+    // Fact check stream
     await act(async () => {
       mockWorkerInstance.onmessage({ 
         data: { 
-          status: 'fact-check-result', 
-          result: '[True] Yes, water is wet.', 
-          id: '123' 
+          status: 'fact-check-stream', 
+          text: '[True] Yes, water is wet.', 
+          id: '123',
+          isDone: true
         } 
       });
     });
@@ -155,7 +161,7 @@ describe('DebateLens', () => {
 
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'To be cleared.', id: '123' } 
+        data: { status: 'transcription', text: 'To be cleared soon.', id: '123' } 
       });
     });
 
@@ -163,7 +169,7 @@ describe('DebateLens', () => {
     fireEvent.click(clearButton);
 
     await waitFor(() => {
-      expect(screen.queryByText('To be cleared.')).not.toBeInTheDocument();
+      expect(screen.queryByText('To be cleared soon.')).not.toBeInTheDocument();
     });
   });
 
@@ -175,7 +181,7 @@ describe('DebateLens', () => {
 
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Copy me.', id: '123' } 
+        data: { status: 'transcription', text: 'Copy me now.', id: '123' } 
       });
     });
 
@@ -209,7 +215,7 @@ describe('DebateLens', () => {
     render(<DebateLens />);
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'progress', model: 'stt', progress: { progress: 50 } } 
+        data: { status: 'progress', model: 'stt', progress: 50 } 
       });
     });
 
@@ -223,12 +229,8 @@ describe('DebateLens', () => {
         data: { status: 'error', error: 'Critical failure' } 
       });
     });
-
-    // Should stay in loading/error state if not ready? 
-    // Actually the component shows initializing if status is error and not ready.
-    // Wait, the code says: if (status === 'error') setStatus('error');
-    // But then it renders initializing if status is initializing or loading.
-    // Let's check DebateLens.tsx logic for status === 'error'
+    
+    expect(screen.getByText('Critical failure')).toBeInTheDocument();
   });
 
   it('triggers onSpeechEnd and posts message to worker', async () => {
@@ -240,10 +242,13 @@ describe('DebateLens', () => {
       onSpeechEnd(audio);
     });
 
-    expect(mockWorkerInstance.postMessage).toHaveBeenCalledWith({
-      type: 'transcribe',
-      data: expect.objectContaining({ audio })
-    });
+    expect(mockWorkerInstance.postMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: 'transcribe',
+        data: expect.objectContaining({ audio })
+      }),
+      expect.any(Array)
+    );
   });
 
   it('handles per-transcript errors', async () => {
@@ -254,7 +259,7 @@ describe('DebateLens', () => {
 
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Error prone text', id: 'err-1' } 
+        data: { status: 'transcription', text: 'Error prone text here.', id: 'err-1' } 
       });
     });
 
@@ -264,7 +269,7 @@ describe('DebateLens', () => {
       });
     });
 
-    expect(await screen.findByText(/Error during fact-check: API Timeout/i)).toBeInTheDocument();
+    expect(await screen.findByText(/Error: API Timeout/i)).toBeInTheDocument();
   });
 
   it('robustly parses different fact-check formats', async () => {
@@ -276,10 +281,10 @@ describe('DebateLens', () => {
     // Format: Verdict: Explanation
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Format 1', id: 'f1' } 
+        data: { status: 'transcription', text: 'Format 1 is here.', id: 'f1' } 
       });
       mockWorkerInstance.onmessage({ 
-        data: { status: 'fact-check-result', result: 'False: That is not right.', id: 'f1' } 
+        data: { status: 'fact-check-stream', text: 'False: That is not right.', id: 'f1', isDone: true } 
       });
     });
     expect(await screen.findByText('False')).toBeInTheDocument();
@@ -288,17 +293,17 @@ describe('DebateLens', () => {
     // Format: Just text with keyword
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Format 2', id: 'f2' } 
+        data: { status: 'transcription', text: 'Format 2 is here.', id: 'f2' } 
       });
       mockWorkerInstance.onmessage({ 
-        data: { status: 'fact-check-result', result: 'This is true because reasons.', id: 'f2' } 
+        data: { status: 'fact-check-stream', text: 'This is true because reasons.', id: 'f2', isDone: true } 
       });
     });
     expect(await screen.findByText('True')).toBeInTheDocument();
   });
 
   it('loads transcripts from localStorage on mount', async () => {
-    const savedTranscripts = [{ id: 'saved-1', text: 'Saved text', speaker: 'A', isChecking: false, timestamp: Date.now() }];
+    const savedTranscripts = [{ id: 'saved-1', text: 'Saved text is long.', speaker: 'A', isChecking: false, timestamp: Date.now() }];
     vi.mocked(localStorage.getItem).mockReturnValue(JSON.stringify(savedTranscripts));
     
     render(<DebateLens />);
@@ -307,7 +312,7 @@ describe('DebateLens', () => {
       mockWorkerInstance.onmessage({ data: { status: 'ready' } });
     });
     
-    expect(await screen.findByText('Saved text')).toBeInTheDocument();
+    expect(await screen.findByText('Saved text is long.')).toBeInTheDocument();
   });
 
   it('handles localStorage parse error', async () => {
@@ -328,10 +333,10 @@ describe('DebateLens', () => {
 
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Fallback test', id: 'fb-1' } 
+        data: { status: 'transcription', text: 'Fallback test is here.', id: 'fb-1' } 
       });
       mockWorkerInstance.onmessage({ 
-        data: { status: 'fact-check-result', result: 'Completely weird response', id: 'fb-1' } 
+        data: { status: 'fact-check-stream', text: 'Completely weird response', id: 'fb-1', isDone: true } 
       });
     });
     expect(await screen.findByText('Unverified')).toBeInTheDocument();
