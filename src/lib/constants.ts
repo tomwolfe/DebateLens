@@ -4,3 +4,5 @@ export const MODELS = {
 };
 
 export const VAD_MODEL_URL = 'https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.7/dist/silero_vad.onnx';
+
+export const DEBOUNCE_MS = 1500;

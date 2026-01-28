@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
 import { renderHook } from '@testing-library/react';
 import { useAudioProcessor } from './useAudioProcessor';
 import { useMicVAD } from '@ricky0123/vad-react';

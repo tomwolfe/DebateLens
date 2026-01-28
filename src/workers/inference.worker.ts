@@ -59,7 +59,7 @@ class InferencePipeline {
 const transcriptionQueue: { data: any }[] = [];
 const factCheckQueue: { data: any }[] = [];
 let isProcessing = false;
-const MAX_FACT_CHECK_QUEUE_SIZE = 2;
+const MAX_FACT_CHECK_QUEUE_SIZE = 10; // Increased from 2
 
 async function processQueue() {
   if (isProcessing) return;
@@ -75,9 +75,13 @@ async function processQueue() {
     item = factCheckQueue.shift();
   }
 
-  if (!type || !item) return;
+  if (!type || !item) {
+    self.postMessage({ busy: false });
+    return;
+  }
   
   isProcessing = true;
+  self.postMessage({ busy: true });
   const { data } = item;
 
   try {
@@ -93,17 +97,24 @@ async function processQueue() {
       const llm = await InferencePipeline.getLLM();
       
       const prompt = `<|system|>
-You are a real-time fact-checker. Analyze the following text and determine if it contains a verifiable factual claim.
-- If it is NOT a factual claim (e.g., greeting, opinion, fragment, filler), start your response with [NOT_A_CLAIM].
-- If it IS a factual claim, start your response with [VERDICT] followed by True, False, or Unverified, then a 1-sentence explanation.
+You are a real-time fact-checker. Analyze the text and determine if it contains a verifiable factual claim.
+- If it is NOT a factual claim (greeting, opinion, filler, command, question), response: [NOT_A_CLAIM]
+- If it IS a factual claim, response: [VERDICT] {True|False|Unverified}. {1-sentence explanation}
 
-Example 1: "Hello how are you?" -> [NOT_A_CLAIM]
-Example 2: "The moon is made of cheese." -> [VERDICT] False. The moon is composed of rock and metal.
-Example 3: "I think we should go." -> [NOT_A_CLAIM]
+STRICT RULES:
+1. Start ONLY with [NOT_A_CLAIM] or [VERDICT].
+2. Explanation must be concise.
+3. Don't hallucinate; if unsure, use Unverified.
 
-Format: [VERDICT] {Verdict} {Explanation} or [NOT_A_CLAIM]<|end|>
-<|user|>
+Examples:
+- "The capital of France is Paris." -> [VERDICT] True. Paris is the capital and largest city of France.
+- "What time is it?" -> [NOT_A_CLAIM]
+- "The Earth is flat." -> [VERDICT] False. The Earth is an oblate spheroid.
+
+Input text to analyze:
 "${data.text}"<|end|>
+<|user|>
+Check the claim: "${data.text}"<|end|>
 <|assistant|>`;
 
       let fullResponse = '';
@@ -112,7 +123,6 @@ Format: [VERDICT] {Verdict} {Explanation} or [NOT_A_CLAIM]<|end|>
         callback_function: (text: string) => {
           fullResponse += text;
           
-          // Early exit if we detect NOT_A_CLAIM
           if (fullResponse.includes('[NOT_A_CLAIM]')) {
             self.postMessage({ 
               status: 'fact-check-stream', 
@@ -133,7 +143,7 @@ Format: [VERDICT] {Verdict} {Explanation} or [NOT_A_CLAIM]<|end|>
       });
 
       await llm(prompt, {
-        max_new_tokens: 100,
+        max_new_tokens: 128,
         temperature: 0,
         do_sample: false,
         streamer,
@@ -153,7 +163,6 @@ Format: [VERDICT] {Verdict} {Explanation} or [NOT_A_CLAIM]<|end|>
     self.postMessage({ status: 'error', error: error.message, id: data.id, task: type });
   } finally {
     isProcessing = false;
-    // Process next item in the next tick
     setTimeout(processQueue, 0);
   }
 }
@@ -180,12 +189,11 @@ self.onmessage = async (e: MessageEvent) => {
     transcriptionQueue.push({ data });
     processQueue();
   } else if (type === 'fact-check') {
-    // Leaky queue for fact-checks only
     if (factCheckQueue.length >= MAX_FACT_CHECK_QUEUE_SIZE) {
+      // Still leaky but larger capacity
       factCheckQueue.shift();
     }
     factCheckQueue.push({ data });
     processQueue();
   }
 };
-

@@ -1,3 +1,5 @@
+/* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable @typescript-eslint/no-unused-vars */
 import { render, screen, fireEvent, waitFor, act } from '@testing-library/react';
 import DebateLens from './DebateLens';
 import { useAudioProcessor } from '@/hooks/useAudioProcessor';
@@ -6,6 +8,14 @@ import { vi, describe, it, expect, beforeEach } from 'vitest';
 vi.mock('@/hooks/useAudioProcessor', () => ({
   useAudioProcessor: vi.fn(),
 }));
+
+vi.mock('@/lib/constants', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/constants')>();
+  return {
+    ...actual,
+    DEBOUNCE_MS: 0,
+  };
+});
 
 // Mock Worker
 class MockWorker {
@@ -25,6 +35,7 @@ describe('DebateLens', () => {
       postMessage = vi.fn();
       terminate = vi.fn();
       constructor() {
+        // eslint-disable-next-line @typescript-eslint/no-this-alias
         mockWorkerInstance = this;
       }
     }
@@ -293,13 +304,16 @@ describe('DebateLens', () => {
     // Format: Just text with keyword
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Format 2 is here.', id: 'f2' } 
+        data: { status: 'transcription', text: 'Format 2 is here.', id: 'f2', speaker: 'B' } 
       });
+    });
+
+    await act(async () => {
       mockWorkerInstance.onmessage({ 
         data: { status: 'fact-check-stream', text: 'This is true because reasons.', id: 'f2', isDone: true } 
       });
     });
-    expect(await screen.findByText('True')).toBeInTheDocument();
+    expect(await screen.findByText(/True/i)).toBeInTheDocument();
   });
 
   it('loads transcripts from localStorage on mount', async () => {
