@@ -126,7 +126,8 @@ describe('DebateLens', () => {
         data: { 
           status: 'transcription', 
           text: 'This is a test claim.', 
-          id: 'test-id' 
+          id: 'test-id',
+          speaker: 'A'
         } 
       });
     });
@@ -144,7 +145,7 @@ describe('DebateLens', () => {
     // Transcription first
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Water is wet and cold.', id: '123' } 
+        data: { status: 'transcription', text: 'Water is wet and cold.', id: '123', speaker: 'A' } 
       });
     });
 
@@ -172,7 +173,7 @@ describe('DebateLens', () => {
 
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'To be cleared soon.', id: '123' } 
+        data: { status: 'transcription', text: 'To be cleared soon.', id: '123', speaker: 'A' } 
       });
     });
 
@@ -192,7 +193,7 @@ describe('DebateLens', () => {
 
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Copy me now.', id: '123' } 
+        data: { status: 'transcription', text: 'Copy me now.', id: '123', speaker: 'A' } 
       });
     });
 
@@ -270,7 +271,7 @@ describe('DebateLens', () => {
 
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Error prone text here.', id: 'err-1' } 
+        data: { status: 'transcription', text: 'Error prone text here.', id: 'err-1', speaker: 'A' } 
       });
     });
 
@@ -292,7 +293,7 @@ describe('DebateLens', () => {
     // Format: Verdict: Explanation
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Format 1 is here.', id: 'f1' } 
+        data: { status: 'transcription', text: 'Format 1 is here.', id: 'f1', speaker: 'A' } 
       });
       mockWorkerInstance.onmessage({ 
         data: { status: 'fact-check-stream', text: 'False: That is not right.', id: 'f1', isDone: true } 
@@ -335,7 +336,7 @@ describe('DebateLens', () => {
     
     render(<DebateLens />);
     
-    expect(consoleSpy).toHaveBeenCalledWith('Failed to parse saved transcripts', expect.any(Error));
+    expect(consoleSpy).toHaveBeenCalledWith('Error reading from localStorage key "debatelens_transcripts":', expect.any(Error));
     consoleSpy.mockRestore();
   });
 
@@ -347,7 +348,7 @@ describe('DebateLens', () => {
 
     await act(async () => {
       mockWorkerInstance.onmessage({ 
-        data: { status: 'transcription', text: 'Fallback test is here.', id: 'fb-1' } 
+        data: { status: 'transcription', text: 'Fallback test is here.', id: 'fb-1', speaker: 'A' } 
       });
       mockWorkerInstance.onmessage({ 
         data: { status: 'fact-check-stream', text: 'Completely weird response', id: 'fb-1', isDone: true } 

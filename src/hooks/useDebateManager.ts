@@ -1,8 +1,8 @@
-'use client';
-
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { useAudioProcessor } from './useAudioProcessor';
 import { DEBOUNCE_MS } from '@/lib/constants';
+import { WorkerRequest, WorkerResponse } from '@/types/worker-messages';
+import { storage, pruneTranscripts } from '@/lib/storage';
 
 export interface FactCheck {
   verdict: 'True' | 'False' | 'Unverified' | 'NOT_A_CLAIM';
@@ -21,21 +21,13 @@ export interface Transcript {
 
 export type AppStatus = 'initializing' | 'loading' | 'ready' | 'error';
 
+const STORAGE_KEY = 'debatelens_transcripts';
+const MAX_TRANSCRIPTS = 100;
+
 export function useDebateManager() {
   const [transcripts, setTranscripts] = useState<Transcript[]>(() => {
-    if (typeof window !== 'undefined') {
-      const saved = localStorage.getItem('debatelens_transcripts');
-      if (saved) {
-        try {
-          const parsed = JSON.parse(saved);
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          return parsed.map((t: any) => ({ ...t, isChecking: false }));
-        } catch (e) {
-          console.error('Failed to parse saved transcripts', e);
-        }
-      }
-    }
-    return [];
+    const saved = storage.get<Transcript[]>(STORAGE_KEY, []);
+    return saved.map(t => ({ ...t, isChecking: false }));
   });
 
   const [activeSpeaker, setActiveSpeaker] = useState<'A' | 'B'>('A');
@@ -56,13 +48,15 @@ export function useDebateManager() {
 
   // Fetch devices
   useEffect(() => {
-    navigator.mediaDevices.enumerateDevices().then(devs => {
-      const audioDevices = devs.filter(d => d.kind === 'audioinput');
-      setDevices(audioDevices);
-      if (audioDevices.length > 0 && !selectedDevice) {
-        setSelectedDevice(audioDevices[0].deviceId);
-      }
-    });
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices) {
+      navigator.mediaDevices.enumerateDevices().then(devs => {
+        const audioDevices = devs.filter(d => d.kind === 'audioinput');
+        setDevices(audioDevices);
+        if (audioDevices.length > 0 && !selectedDevice) {
+          setSelectedDevice(audioDevices[0].deviceId);
+        }
+      });
+    }
   }, [selectedDevice]);
 
   const triggerFactCheck = useCallback((text: string, id: string) => {
@@ -75,10 +69,11 @@ export function useDebateManager() {
         t.id === id ? { ...t, isChecking: true } : t
       ));
       
-      workerRef.current?.postMessage({
+      const request: WorkerRequest = {
         type: 'fact-check',
         data: { text, id }
-      });
+      };
+      workerRef.current?.postMessage(request);
       delete factCheckTimers.current[id];
     }, DEBOUNCE_MS);
   }, []);
@@ -120,7 +115,8 @@ export function useDebateManager() {
       };
 
       triggerFactCheck(trimmedText, id);
-      return [...prev, newTranscript];
+      const updated = [...prev, newTranscript];
+      return pruneTranscripts(updated, MAX_TRANSCRIPTS);
     });
   }, [triggerFactCheck]);
 
@@ -129,7 +125,7 @@ export function useDebateManager() {
       if (t.id === id) {
         const trimmedResult = result.trim();
 
-        if (trimmedResult.includes('NOT_A_CLAIM')) {
+        if (trimmedResult === 'NOT_A_CLAIM' || trimmedResult.includes('NOT_A_CLAIM')) {
           return {
             ...t,
             isChecking: false,
@@ -177,10 +173,11 @@ export function useDebateManager() {
   const onSpeechEnd = useCallback((audio: Float32Array) => {
     const id = Math.random().toString(36).substring(7);
     if (workerRef.current) {
-      workerRef.current.postMessage({
+      const request: WorkerRequest = {
         type: 'transcribe',
         data: { audio, id, speaker: activeSpeakerRef.current }
-      }, [audio.buffer]);
+      };
+      workerRef.current.postMessage(request, [audio.buffer]);
     }
   }, []);
 
@@ -191,7 +188,7 @@ export function useDebateManager() {
         type: 'module'
     });
 
-    w.onmessage = (e) => {
+    w.onmessage = (e: MessageEvent<WorkerResponse>) => {
       const { status, progress: p, model, text, id, speaker, error, isDone, busy } = e.data;
 
       if (busy !== undefined) setIsWorkerBusy(busy);
@@ -203,22 +200,25 @@ export function useDebateManager() {
           ));
         } else {
           setStatus('error');
-          setErrorMessage(error);
+          setErrorMessage(error || 'An unknown error occurred');
         }
       }
       if (status === 'progress') {
         setStatus('loading');
-        setProgress(prev => ({ ...prev, [model]: p }));
+        if (model && p !== undefined) {
+          setProgress(prev => ({ ...prev, [model]: p }));
+        }
       }
-      if (status === 'transcription') {
+      if (status === 'transcription' && text && id && speaker) {
         handleTranscription(text, id, speaker);
       }
-      if (status === 'fact-check-stream') {
-        handleFactCheckStream(text, id, isDone);
+      if (status === 'fact-check-stream' && text && id) {
+        handleFactCheckStream(text, id, !!isDone);
       }
     };
 
-    w.postMessage({ type: 'load' });
+    const loadRequest: WorkerRequest = { type: 'load' };
+    w.postMessage(loadRequest);
     workerRef.current = w;
 
     return () => w.terminate();
@@ -226,13 +226,13 @@ export function useDebateManager() {
 
   // Persistence
   useEffect(() => {
-    localStorage.setItem('debatelens_transcripts', JSON.stringify(transcripts));
+    storage.set(STORAGE_KEY, transcripts);
   }, [transcripts]);
 
   const clearFeed = useCallback(() => {
     if (confirm('Clear all transcripts?')) {
       setTranscripts([]);
-      localStorage.removeItem('debatelens_transcripts');
+      storage.remove(STORAGE_KEY);
     }
   }, []);
 
@@ -252,22 +252,26 @@ export function useDebateManager() {
       const id = Math.random().toString(36).substring(7);
       const now = Date.now();
 
-      setTranscripts(prev => [
-        ...prev,
-        {
-          id,
-          text,
-          speaker: activeSpeakerRef.current,
-          isChecking: true,
-          timestamp: now,
-          lastUpdated: now,
-        }
-      ]);
+      setTranscripts(prev => {
+        const updated = [
+          ...prev,
+          {
+            id,
+            text,
+            speaker: activeSpeakerRef.current,
+            isChecking: true,
+            timestamp: now,
+            lastUpdated: now,
+          }
+        ];
+        return pruneTranscripts(updated, MAX_TRANSCRIPTS);
+      });
 
-      workerRef.current?.postMessage({
+      const request: WorkerRequest = {
         type: 'fact-check',
         data: { text, id }
-      });
+      };
+      workerRef.current?.postMessage(request);
     }
   }, []);
 
@@ -298,3 +302,4 @@ export function useDebateManager() {
     toggleListening,
   };
 }
+

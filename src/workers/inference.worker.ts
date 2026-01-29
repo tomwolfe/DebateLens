@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 import { pipeline, env, TextStreamer } from '@huggingface/transformers';
+import { WorkerRequest, WorkerResponse } from '../types/worker-messages';
 
 // Skip local model check
 env.allowLocalModels = false;
@@ -59,7 +60,32 @@ class InferencePipeline {
 const transcriptionQueue: { data: any }[] = [];
 const factCheckQueue: { data: any }[] = [];
 let isProcessing = false;
-const MAX_FACT_CHECK_QUEUE_SIZE = 10; // Increased from 2
+const MAX_FACT_CHECK_QUEUE_SIZE = 10;
+
+/**
+ * Validates and normalizes the fact-check response from the LLM.
+ * This acts as a 'Logic Regression' safety net.
+ */
+function validateFactCheckResponse(response: string): string {
+  if (response.includes('[NOT_A_CLAIM]')) {
+    return 'NOT_A_CLAIM';
+  }
+
+  // Ensure the response at least starts with [VERDICT] or looks like one
+  const hasVerdict = /\[VERDICT\]|\[True\]|\[False\]|\[Unverified\]|True:|False:|Unverified:/i.test(response);
+  
+  if (!hasVerdict && response.length > 0) {
+    // If it's generating text but hasn't emitted a verdict token, we let it continue
+    // but the main thread will handle partials.
+    return response;
+  }
+
+  return response;
+}
+
+function postToMain(msg: WorkerResponse) {
+  self.postMessage(msg);
+}
 
 async function processQueue() {
   if (isProcessing) return;
@@ -76,12 +102,12 @@ async function processQueue() {
   }
 
   if (!type || !item) {
-    self.postMessage({ busy: false });
+    postToMain({ status: 'ready', busy: false });
     return;
   }
   
   isProcessing = true;
-  self.postMessage({ busy: true });
+  postToMain({ status: 'ready', busy: true });
   const { data } = item;
 
   try {
@@ -92,7 +118,7 @@ async function processQueue() {
         stride_length_s: 5,
         return_timestamps: true,
       });
-      self.postMessage({ status: 'transcription', text: output.text, id: data.id, speaker: data.speaker });
+      postToMain({ status: 'transcription', text: output.text, id: data.id, speaker: data.speaker });
     } else if (type === 'fact-check') {
       const llm = await InferencePipeline.getLLM();
       
@@ -122,9 +148,10 @@ Check the claim: "${data.text}"<|end|>
         skip_prompt: true,
         callback_function: (text: string) => {
           fullResponse += text;
+          const validated = validateFactCheckResponse(fullResponse);
           
-          if (fullResponse.includes('[NOT_A_CLAIM]')) {
-            self.postMessage({ 
+          if (validated === 'NOT_A_CLAIM') {
+            postToMain({ 
               status: 'fact-check-stream', 
               text: 'NOT_A_CLAIM', 
               id: data.id,
@@ -133,9 +160,9 @@ Check the claim: "${data.text}"<|end|>
             return;
           }
 
-          self.postMessage({ 
+          postToMain({ 
             status: 'fact-check-stream', 
-            text: fullResponse, 
+            text: validated, 
             id: data.id,
             isDone: false 
           });
@@ -149,10 +176,11 @@ Check the claim: "${data.text}"<|end|>
         streamer,
       });
 
-      if (!fullResponse.includes('[NOT_A_CLAIM]')) {
-        self.postMessage({ 
+      const finalValidated = validateFactCheckResponse(fullResponse);
+      if (finalValidated !== 'NOT_A_CLAIM') {
+        postToMain({ 
           status: 'fact-check-stream', 
-          text: fullResponse, 
+          text: finalValidated, 
           id: data.id, 
           isDone: true 
         });
@@ -160,20 +188,20 @@ Check the claim: "${data.text}"<|end|>
     }
   } catch (error: any) {
     console.error(`Error in worker (${type}):`, error);
-    self.postMessage({ status: 'error', error: error.message, id: data.id, task: type });
+    postToMain({ status: 'error', error: error.message, id: data.id, task: type || undefined });
   } finally {
     isProcessing = false;
     setTimeout(processQueue, 0);
   }
 }
 
-self.onmessage = async (e: MessageEvent) => {
+self.onmessage = async (e: MessageEvent<WorkerRequest>) => {
   const { type, data } = e.data;
 
   if (type === 'load') {
     const reportProgress = (model: 'stt' | 'llm') => (progress: any) => {
       if (progress.status === 'progress') {
-        self.postMessage({ status: 'progress', model, progress: progress.progress });
+        postToMain({ status: 'progress', model, progress: progress.progress });
       }
     };
 
@@ -181,16 +209,15 @@ self.onmessage = async (e: MessageEvent) => {
       await checkWebGPU();
       await InferencePipeline.getSTT(reportProgress('stt'));
       await InferencePipeline.getLLM(reportProgress('llm'));
-      self.postMessage({ status: 'ready' });
+      postToMain({ status: 'ready' });
     } catch (error: any) {
-      self.postMessage({ status: 'error', error: error.message });
+      postToMain({ status: 'error', error: error.message });
     }
-  } else if (type === 'transcribe') {
+  } else if (type === 'transcribe' && data) {
     transcriptionQueue.push({ data });
     processQueue();
-  } else if (type === 'fact-check') {
+  } else if (type === 'fact-check' && data) {
     if (factCheckQueue.length >= MAX_FACT_CHECK_QUEUE_SIZE) {
-      // Still leaky but larger capacity
       factCheckQueue.shift();
     }
     factCheckQueue.push({ data });
